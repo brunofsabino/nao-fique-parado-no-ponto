@@ -17,6 +17,7 @@ export default function Login() {
             password,
             redirect: false,
         });
+        console.log(res);
         if (res?.ok) {
             router.push('/upload');
         } else {
