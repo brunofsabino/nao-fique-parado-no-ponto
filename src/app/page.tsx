@@ -701,11 +701,16 @@ interface Stop {
   stop_lat: number;
   stop_lon: number;
   distance: number;
-  lines: { name: string; routeId: string }[];
+  lines: { name: string; routeId: string }[]; // Ajustado para objetos
 }
 
 interface SelectedStop extends Stop {
   geometry?: { location: google.maps.LatLng };
+}
+
+interface BusPosition {
+  py: number;
+  px: number;
 }
 
 export default function Home() {
@@ -715,6 +720,7 @@ export default function Home() {
   const [selectedLine, setSelectedLine] = useState<string | null>(null);
   const [busArrivalTime, setBusArrivalTime] = useState<string | null>(null);
   const [walkingTime, setWalkingTime] = useState<string | null>(null);
+  const [busPositions, setBusPositions] = useState<BusPosition[]>([]);
   const [map, setMap] = useState<google.maps.Map | null>(null);
   const [isGoogleLoaded, setIsGoogleLoaded] = useState(false);
 
@@ -734,13 +740,15 @@ export default function Home() {
       .load()
       .then(() => {
         setIsGoogleLoaded(true);
-        const mapElement = document.getElementById('map');
-        if (mapElement && userLocation) {
-          const googleMap = new google.maps.Map(mapElement, {
-            center: userLocation,
-            zoom: 15,
-          });
-          setMap(googleMap);
+        if (userLocation) {
+          const mapElement = document.getElementById('map');
+          if (mapElement) {
+            const googleMap = new google.maps.Map(mapElement, {
+              center: userLocation,
+              zoom: 15,
+            });
+            setMap(googleMap);
+          }
         }
       })
       .catch((error) => console.error('Erro ao carregar Google Maps:', error));
@@ -765,34 +773,6 @@ export default function Home() {
     }
   }, [userLocation]);
 
-  useEffect(() => {
-    if (map && busStops.length > 0 && isGoogleLoaded) {
-      const infoWindow = new google.maps.InfoWindow();
-      busStops.forEach((stop) => {
-        const marker = new google.maps.Marker({
-          position: { lat: stop.stop_lat, lng: stop.stop_lon },
-          map,
-          title: stop.stop_name,
-          icon: {
-            url: 'http://maps.google.com/mapfiles/ms/icons/blue-dot.png',
-            scaledSize: new google.maps.Size(32, 32),
-          },
-        });
-
-        marker.addListener('click', () => {
-          const content = `
-            <div>
-              <h3>${stop.stop_name}</h3>
-              <p>Linhas: ${stop.lines.length > 0 ? stop.lines.map(l => l.name).join(', ') : 'Nenhuma linha encontrada'}</p>
-            </div>
-          `;
-          infoWindow.setContent(content);
-          infoWindow.open(map, marker);
-        });
-      });
-    }
-  }, [map, busStops, isGoogleLoaded]);
-
   const fetchNearbyBusStops = async (location: Location) => {
     try {
       const response = await fetch(
@@ -801,7 +781,6 @@ export default function Home() {
       if (!response.ok) throw new Error('Erro na resposta da API');
       const stops: Stop[] = await response.json();
 
-      // Buscar linhas para cada ponto
       const stopsWithLines = await Promise.all(
         stops.map(async (stop) => {
           const lines = await fetchLinesForStop(stop.stop_id);
@@ -828,9 +807,7 @@ export default function Home() {
 
   const authenticateSPTrans = async () => {
     try {
-      const response = await fetch('/api/sptrans-auth', {
-        method: 'POST',
-      });
+      const response = await fetch('/api/sptrans-auth', { method: 'POST' });
       if (!response.ok) throw new Error('Falha na autenticação SPTrans');
       const { success } = await response.json();
       return success;
@@ -840,7 +817,7 @@ export default function Home() {
     }
   };
 
-  const fetchBusArrivalTime = async (stopId: string, routeId: string) => {
+  const fetchBusArrivalTime = async (stopId: string, lineName: string) => {
     try {
       const authCheck = await fetch('/api/sptrans-auth', { method: 'GET' });
       let isAuthenticated = (await authCheck.json()).isAuthenticated;
@@ -850,15 +827,35 @@ export default function Home() {
       }
       if (!isAuthenticated) throw new Error('Autenticação falhou');
 
-      const response = await fetch(`/api/sptrans-arrival?stopId=${stopId}&routeId=${encodeURIComponent(routeId)}`, {
+      const response = await fetch(`/api/sptrans-arrival?stopId=${stopId}&routeId=${encodeURIComponent(lineName)}`, {
         method: 'GET',
       });
       if (!response.ok) throw new Error('Erro na API SPTrans');
-      const { arrivalTime } = await response.json();
+      const { arrivalTime, busPositions } = await response.json();
       setBusArrivalTime(arrivalTime);
+      setBusPositions(busPositions);
+      if (arrivalTime === "Indisponível" && busPositions.length > 0 && selectedStop) {
+        await calculateNearestBusTime(selectedStop, busPositions);
+      }
     } catch (error) {
       console.error('Erro ao buscar previsão de chegada:', error);
       setBusArrivalTime('Indisponível');
+    }
+  };
+
+  const fetchRoutePath = async (lineName: string) => {
+    try {
+      const response = await fetch(`/api/route-path?routeShortName=${encodeURIComponent(lineName)}`);
+      if (!response.ok) {
+        const errorData = await response.json();
+        console.error('Erro na resposta de /api/route-path:', errorData);
+        return [];
+      }
+      const { path } = await response.json();
+      return path.map((point: any) => ({ lat: point.shape_pt_lat, lng: point.shape_pt_lon }));
+    } catch (error) {
+      console.error('Erro ao buscar traçado da linha:', error);
+      return [];
     }
   };
 
@@ -876,15 +873,8 @@ export default function Home() {
       directionsService.route(
         request,
         (result: google.maps.DirectionsResult | null, status: google.maps.DirectionsStatus) => {
-          if (
-            status === google.maps.DirectionsStatus.OK &&
-            result &&
-            result.routes &&
-            result.routes[0].legs &&
-            result.routes[0].legs[0].duration
-          ) {
-            const duration = result.routes[0].legs[0].duration.text;
-            setWalkingTime(duration);
+          if (status === google.maps.DirectionsStatus.OK && result?.routes?.[0]?.legs?.[0]?.duration) {
+            setWalkingTime(result.routes[0].legs[0].duration.text);
           } else {
             console.error('Erro ao calcular tempo de caminhada:', status);
             setWalkingTime('Indisponível');
@@ -897,22 +887,116 @@ export default function Home() {
     }
   };
 
+  const calculateNearestBusTime = async (stop: SelectedStop, positions: BusPosition[]) => {
+    if (!isGoogleLoaded || !google || !stop.geometry) return;
+
+    const directionsService = new google.maps.DirectionsService();
+    const stopLocation = stop.geometry.location;
+
+    let minDuration = Infinity;
+    let nearestTime = "Indisponível";
+
+    for (const pos of positions) {
+      const busLocation = new google.maps.LatLng(pos.py, pos.px);
+      const request: google.maps.DirectionsRequest = {
+        origin: busLocation,
+        destination: stopLocation,
+        travelMode: google.maps.TravelMode.DRIVING,
+      };
+
+      try {
+        const result = await new Promise<google.maps.DirectionsResult>((resolve, reject) => {
+          directionsService.route(request, (res, status) => {
+            if (status === google.maps.DirectionsStatus.OK && res) resolve(res);
+            else reject(status);
+          });
+        });
+
+        const route = result.routes[0];
+        if (route && route.legs && route.legs[0] && route.legs[0].duration) {
+          const duration = route.legs[0].duration.value; // Agora seguro com verificação
+          if (duration < minDuration) {
+            minDuration = duration;
+            nearestTime = `${Math.ceil(duration / 60)} min`;
+          }
+        }
+      } catch (error) {
+        console.error('Erro ao calcular tempo do ônibus:', error);
+      }
+    }
+
+    setBusArrivalTime(nearestTime);
+  };
+
   const handleLineSelection = async (stop: Stop, line: { name: string; routeId: string }) => {
-    if (!isGoogleLoaded || !google) return;
+    if (!isGoogleLoaded || !google || !map) return;
 
     const stopWithGeometry: SelectedStop = {
       ...stop,
-      geometry: {
-        location: new google.maps.LatLng(stop.stop_lat, stop.stop_lon),
-      },
+      geometry: { location: new google.maps.LatLng(stop.stop_lat, stop.stop_lon) },
     };
     setSelectedStop(stopWithGeometry);
     setSelectedLine(line.name);
-    await fetchBusArrivalTime(stop.stop_id, line.name); // Usa line.name em vez de line.routeId
+
+    await fetchBusArrivalTime(stop.stop_id, line.name);
+
+    const path = await fetchRoutePath(line.name);
+    if (path.length > 0) {
+      const polyline = new google.maps.Polyline({
+        path,
+        geodesic: true,
+        strokeColor: '#FF0000',
+        strokeOpacity: 1.0,
+        strokeWeight: 2,
+      });
+      polyline.setMap(map);
+    } else {
+      console.log(`Nenhum traçado disponível para ${line.name}`);
+    }
+
+    busPositions.forEach((pos) => {
+      new google.maps.Marker({
+        position: { lat: pos.py, lng: pos.px },
+        map,
+        icon: {
+          url: 'http://maps.google.com/mapfiles/kml/shapes/bus.png',
+          scaledSize: new google.maps.Size(32, 32),
+        },
+      });
+    });
+
     if (userLocation && stopWithGeometry.geometry) {
       await fetchWalkingTime(userLocation, stopWithGeometry.geometry.location);
     }
   };
+
+  useEffect(() => {
+    if (map && busStops.length > 0 && isGoogleLoaded) {
+      const infoWindow = new google.maps.InfoWindow();
+      busStops.forEach((stop) => {
+        const marker = new google.maps.Marker({
+          position: { lat: stop.stop_lat, lng: stop.stop_lon },
+          map,
+          title: stop.stop_name,
+          icon: {
+            url: 'http://maps.google.com/mapfiles/ms/icons/blue-dot.png',
+            scaledSize: new google.maps.Size(32, 32),
+          },
+        });
+
+        marker.addListener('click', () => {
+          const content = `
+            <div>
+              <h3>${stop.stop_name}</h3>
+              <p>Linhas: ${stop.lines.length > 0 ? stop.lines.join(', ') : 'Nenhuma linha encontrada'}</p>
+            </div>
+          `;
+          infoWindow.setContent(content);
+          infoWindow.open(map, marker);
+        });
+      });
+    }
+  }, [map, busStops, isGoogleLoaded]);
 
   return (
     <div className="p-4">
@@ -934,7 +1018,7 @@ export default function Home() {
                       <strong>{stop.stop_name} - {Math.round(stop.distance)}m</strong>
                       <ul className="ml-4 space-y-1">
                         {stop.lines.map((line) => (
-                          <li key={line.routeId}>
+                          <li key={line.routeId}> {/* Usa routeId como chave única */}
                             <Dialog>
                               <DialogTrigger asChild>
                                 <Button
@@ -942,7 +1026,7 @@ export default function Home() {
                                   className="p-0 h-auto"
                                   onClick={() => handleLineSelection(stop, line)}
                                 >
-                                  {line.name}
+                                  {line.name} {/* Renderiza apenas o nome */}
                                 </Button>
                               </DialogTrigger>
                               {selectedStop?.stop_id === stop.stop_id && selectedLine === line.name && (
@@ -955,7 +1039,7 @@ export default function Home() {
                                   <div>
                                     <p>Tempo até o ônibus: {busArrivalTime || 'Calculando...'}</p>
                                     <p>Tempo de caminhada: {walkingTime || 'Calculando...'}</p>
-                                    {busArrivalTime && walkingTime && (
+                                    {busArrivalTime && walkingTime && busArrivalTime !== 'Indisponível' && (
                                       <p>
                                         Saia em{' '}
                                         {Math.max(0, parseTime(busArrivalTime) - parseTime(walkingTime))}{' '}
